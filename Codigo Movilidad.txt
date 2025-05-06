@@ -1,0 +1,364 @@
+import pandas as pd
+import openpyxl
+from openpyxl.styles import PatternFill # Para el color de fondo
+import tkinter as tk
+from tkinter import filedialog
+import sys
+import os
+import unicodedata # Para quitar tildes
+import re # Para expresiones regulares en la limpieza
+from thefuzz import process # Para fuzzy matching
+
+# --- Constante para el umbral de similitud (ajusta según necesites, 0-100) ---
+SIMILARITY_THRESHOLD = 90 # Ejemplo: 90% de similitud o más para considerar coincidencia
+
+# --- Constante para el color de resaltado (Amarillo) ---
+HIGHLIGHT_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+# --- Función para quitar tildes ---
+def remove_accents(input_str):
+    if pd.isna(input_str): return ""
+    input_str = str(input_str) # Asegurar que sea string
+    nfkd_form = unicodedata.normalize('NFD', input_str)
+    return "".join([c for c in nfkd_form if not unicodedata.combining(c)])
+
+# --- Función para limpiar nombres de cliente ---
+def clean_client_name(client_name):
+    if pd.isna(client_name): return ""
+    text = str(client_name)
+    text = text.split('-', maxsplit=1)[0] # Usar maxsplit=1
+    text = text.strip()
+    text = text.replace('.', '') # Quitar puntos
+    text = remove_accents(text)  # Quitar tildes
+    return text
+
+# --- Función para limpiar Nombre de material usando Regex ---
+def clean_codigo_sap_key_regex(row, key_col_name, corriente_col_name):
+    nombre = str(row[key_col_name]) if pd.notna(row[key_col_name]) else ""
+    corriente = str(row[corriente_col_name]) if pd.notna(row[corriente_col_name]) else ""
+    nombre = nombre.strip()
+    corriente = corriente.strip()
+
+    if corriente:
+        try:
+            # Crear patrón: espacio opcional (\s*), la corriente (escapada),
+            # seguido de caracteres opcionales que NO sean letras/números (\W*), hasta el final ($)
+            # re.IGNORECASE para no distinguir mayúsculas/minúsculas
+            pattern = r'\s*' + re.escape(corriente) + r'\W*$'
+            cleaned_nombre = re.sub(pattern, '', nombre, flags=re.IGNORECASE).strip()
+            return cleaned_nombre
+        except Exception as e_regex:
+            print(f"Advertencia: Error en regex para nombre='{nombre}', corriente='{corriente}': {e_regex}")
+            return nombre # Devolver original en caso de error regex
+    return nombre
+
+# --- 1. Selección Interactiva del Archivo de Entrada ---
+print("--- Iniciando Proceso ---")
+print("Por favor, selecciona el archivo Excel que deseas modificar...")
+root = tk.Tk()
+root.withdraw()
+input_excel_file = filedialog.askopenfilename(
+    title="Selecciona el archivo Excel a modificar",
+    filetypes=[("Archivos Excel", "*.xlsx"), ("Todos los archivos", "*.*")]
+)
+if not input_excel_file:
+    print("\nOperación cancelada.")
+    sys.exit()
+print(f"Archivo de entrada seleccionado: {input_excel_file}")
+
+# --- Definir Nombres de Hojas y Mapeo ---
+source_sheet_name = 'WEB2.0'
+target_sheet_name = 'Plantilla de Cargue 2'
+lookup_sucursal_sheet_name = 'Clientes y sucursales'
+lookup_codigosap1_sheet_name = 'CSAP2'       # Lookup primario SAP
+lookup_codigosap2_sheet_name = 'CodigoSAP'   # Lookup secundario SAP
+
+# Mapeo Fuente -> Destino (Columnas a copiar directamente)
+column_mapping = {
+    'Cliente': 'CLIENTE',
+    'Fecha CC': 'FECHA DE SERVICIO',
+    'Placa': 'PLACA DEL VEHICULO', # Nombre corregido previamente
+    'Peso Recogido': 'CANTIDAD (PESO)'
+}
+# Columnas que esperamos encontrar/llenar en la hoja Destino
+target_columns_names = list(column_mapping.values())
+target_columns_names.extend(['SUCURSAL', 'CÓDIGO SAP DEL MATERIAL'])
+TARGET_START_ROW = 2
+
+# --- 2. Leer Datos Fuente y Lookups, Limpiar Cliente, Preparar Mapas ---
+try:
+    # Leer hoja fuente (WEB2.0)
+    df_web = pd.read_excel(input_excel_file, sheet_name=source_sheet_name)
+    print(f"Datos leídos de '{source_sheet_name}' ({len(df_web)} filas).")
+
+    # Leer hoja lookup sucursales
+    df_sucursales = None
+    try:
+        df_sucursales = pd.read_excel(input_excel_file, sheet_name=lookup_sucursal_sheet_name)
+        print(f"Datos leídos de '{lookup_sucursal_sheet_name}' ({len(df_sucursales)} filas).")
+        df_sucursales.columns = df_sucursales.columns.str.strip() # Limpiar headers
+        if 'Cliente' not in df_sucursales.columns or 'Sucursal' not in df_sucursales.columns:
+             print(f"Advertencia: Faltan columnas 'Cliente' o 'Sucursal' en '{lookup_sucursal_sheet_name}'.")
+             df_sucursales = None
+    except ValueError:
+        print(f"Advertencia: No se encontró la hoja '{lookup_sucursal_sheet_name}'.")
+        df_sucursales = None
+
+    # Leer hoja lookup Código SAP 1 (CSAP2)
+    df_codigosap1 = None
+    codigosap_map1 = {}
+    csap1_keys = []
+    try:
+        df_codigosap1 = pd.read_excel(input_excel_file, sheet_name=lookup_codigosap1_sheet_name, skiprows=1)
+        print(f"Datos leídos de '{lookup_codigosap1_sheet_name}' ({len(df_codigosap1)} filas, omitiendo 1 fila).")
+        df_codigosap1.columns = df_codigosap1.columns.str.strip() # Limpiar headers
+        lookup1_key_col = 'Item'
+        lookup1_value_col = 'CÓDIGO SAP'
+        if lookup1_key_col in df_codigosap1.columns and lookup1_value_col in df_codigosap1.columns:
+            print(f"Preparando mapa y lista primario SAP (desde {lookup_codigosap1_sheet_name})...")
+            df_codigosap1[lookup1_key_col] = df_codigosap1[lookup1_key_col].astype(str).str.strip()
+            df_codigosap1[lookup1_value_col] = df_codigosap1[lookup1_value_col].astype(str)
+            codigosap_map1 = df_codigosap1.drop_duplicates(subset=[lookup1_key_col]).set_index(lookup1_key_col)[lookup1_value_col].to_dict()
+            csap1_keys = df_codigosap1[lookup1_key_col].unique().tolist()
+            print(f"Mapa SAP primario ({len(codigosap_map1)}) y lista ({len(csap1_keys)}) creados.")
+        else:
+            print(f"Advertencia: Faltan '{lookup1_key_col}' o '{lookup1_value_col}' en '{lookup_codigosap1_sheet_name}'.")
+            df_codigosap1 = None
+    except ValueError:
+        print(f"Advertencia: No se encontró la hoja '{lookup_codigosap1_sheet_name}'.")
+        df_codigosap1 = None
+
+    # Leer hoja lookup Código SAP 2 (CodigoSAP)
+    df_codigosap2 = None
+    codigosap_map2 = {}
+    csap2_keys = []
+    try:
+        df_codigosap2 = pd.read_excel(input_excel_file, sheet_name=lookup_codigosap2_sheet_name, skiprows=2)
+        print(f"Datos leídos de '{lookup_codigosap2_sheet_name}' ({len(df_codigosap2)} filas, omitiendo 2 filas).")
+        df_codigosap2.columns = df_codigosap2.columns.str.strip() # Limpiar headers
+        print(f" -> Nombres de columna encontrados y limpiados para '{lookup_codigosap2_sheet_name}': {df_codigosap2.columns.tolist()}")
+        lookup2_key_col = 'Nombre de material'
+        lookup2_value_col = 'Código SAP de Material2' # Nombre corregido previamente
+        lookup2_corriente_col = 'Corriente'
+        required_cols_cs2 = [lookup2_key_col, lookup2_value_col, lookup2_corriente_col]
+
+        if all(col in df_codigosap2.columns for col in required_cols_cs2):
+             print(f"Preparando mapa y lista secundario SAP (desde {lookup_codigosap2_sheet_name})...")
+             print(f" -> Limpiando '{lookup2_key_col}' quitando sufijo de '{lookup2_corriente_col}' usando Regex...")
+             # Aplicar la función de limpieza con Regex
+             df_codigosap2['lookup_key_cleaned'] = df_codigosap2.apply(
+                 lambda row: clean_codigo_sap_key_regex(row, lookup2_key_col, lookup2_corriente_col),
+                 axis=1
+             )
+             # Opcional: Imprimir ejemplos para verificar limpieza
+             # print("\n--- DEBUG: Verificando limpieza Regex de 'Nombre de material' ---")
+             # mask_changed = df_codigosap2['lookup_key_cleaned'] != df_codigosap2[lookup2_key_col].astype(str).str.strip()
+             # if not df_codigosap2[mask_changed].empty:
+             #      print("Ejemplos donde la Regex cambió el nombre:")
+             #      print(df_codigosap2[mask_changed][[lookup2_key_col, lookup2_corriente_col, 'lookup_key_cleaned']].head(15).to_markdown(index=False))
+             # else:
+             #      print("La Regex no pareció cambiar ningún nombre en las primeras filas revisadas.")
+             # print("--- FIN DEBUG ---")
+
+             df_codigosap2[lookup2_value_col] = df_codigosap2[lookup2_value_col].astype(str)
+             codigosap_map2 = df_codigosap2.drop_duplicates(subset=['lookup_key_cleaned']).set_index('lookup_key_cleaned')[lookup2_value_col].to_dict()
+             csap2_keys = df_codigosap2['lookup_key_cleaned'].unique().tolist()
+             print(f"Mapa SAP secundario ({len(codigosap_map2)}) y lista ({len(csap2_keys)}) creados usando claves limpias.")
+        else:
+            print(f"Advertencia: Después de limpiar headers, siguen faltando columnas requeridas ({required_cols_cs2}) en '{lookup_codigosap2_sheet_name}'. No se creará mapa secundario.")
+            df_codigosap2 = None
+    except ValueError:
+        print(f"Advertencia: No se encontró la hoja '{lookup_codigosap2_sheet_name}'.")
+        df_codigosap2 = None
+    except Exception as e_inner:
+         print(f"Error procesando {lookup_codigosap2_sheet_name}: {e_inner}")
+         df_codigosap2 = None
+
+
+    # Verificar columnas fuente en df_web
+    source_columns = list(column_mapping.keys())
+    source_columns.append('Residuo')
+    missing_source_cols = [col for col in source_columns if col not in df_web.columns]
+    if missing_source_cols:
+        print(f"\nError: Columnas fuente faltantes en '{source_sheet_name}': {missing_source_cols}")
+        sys.exit()
+    else:
+        print("Verificación de columnas fuente: OK.")
+
+    # Limpiar 'Cliente' en df_web
+    print("Limpiando columna 'Cliente' fuente...")
+    df_web['Cliente_cleaned'] = df_web['Cliente'].apply(clean_client_name)
+    print("Limpieza de 'Cliente' fuente completada.")
+
+    # Preparar mapa Sucursales
+    sucursal_map = {}
+    if df_sucursales is not None:
+        print("Preparando mapa Cliente -> Sucursal...")
+        df_sucursales['Cliente_cleaned'] = df_sucursales['Cliente'].apply(clean_client_name)
+        sucursal_map = df_sucursales.drop_duplicates(subset=['Cliente_cleaned']).set_index('Cliente_cleaned')['Sucursal'].to_dict()
+        print(f"Mapa Sucursal creado con {len(sucursal_map)} entradas.")
+
+except Exception as e:
+    print(f"Error inesperado al leer datos o preparar lookups: {e}")
+    print(f"Tipo de error: {type(e).__name__}")
+    import traceback
+    traceback.print_exc()
+    sys.exit()
+
+# --- 3. Cargar Workbook, Localizar Columnas, Modificar y Guardar ---
+try:
+    # Cargar Workbook
+    try:
+         workbook = openpyxl.load_workbook(input_excel_file)
+         print(f"Archivo Excel '{os.path.basename(input_excel_file)}' cargado.")
+    except Exception as load_err:
+         print(f"Error al cargar el workbook: {load_err}")
+         sys.exit()
+
+    # Acceder a hoja destino
+    if target_sheet_name not in workbook.sheetnames:
+        print(f"Error: La hoja destino '{target_sheet_name}' no existe.")
+        sys.exit()
+    target_ws = workbook[target_sheet_name]
+    print(f"Accediendo a la hoja destino: '{target_sheet_name}'")
+
+    # Localizar TODAS las columnas destino necesarias
+    target_col_indices = {}
+    header_row = target_ws[1]
+    print("Localizando columnas en hoja destino:")
+    for cell in header_row:
+        header_value = str(cell.value).strip() if cell.value is not None else ""
+        if header_value in target_columns_names:
+            target_col_indices[header_value] = cell.column
+            print(f"   - Columna '{header_value}' encontrada en índice: {cell.column}")
+
+    # Verificar columnas destino
+    missing_target_cols = [name for name in target_columns_names if name not in target_col_indices]
+    cols_can_continue_if_missing = []
+    if df_sucursales is None or not sucursal_map :
+        cols_can_continue_if_missing.append('SUCURSAL')
+    if (df_codigosap1 is None or not csap1_keys) and (df_codigosap2 is None or not csap2_keys):
+         cols_can_continue_if_missing.append('CÓDIGO SAP DEL MATERIAL')
+
+    essential_cols_missing = False
+    for col in missing_target_cols:
+        if col in cols_can_continue_if_missing:
+             print(f"Advertencia: No se encontró columna opcional '{col}' destino. No se llenarán esos datos.")
+             if col in target_columns_names: target_columns_names.remove(col) # No la procesaremos
+        else:
+             print(f"Error: Columna esencial '{col}' no encontrada en '{target_sheet_name}'.")
+             essential_cols_missing = True
+
+    if essential_cols_missing:
+        sys.exit()
+    elif missing_target_cols:
+         print("Continuando sin llenar las columnas opcionales faltantes.")
+    else:
+        print("Todas las columnas destino necesarias localizadas.")
+
+
+    # --- Escribir datos (con fuzzy matching para SAP y resaltado) ---
+    print(f"Actualizando datos en '{target_sheet_name}' (Umbral similitud SAP={SIMILARITY_THRESHOLD}%)...")
+    num_rows_written = 0
+    for index, source_row in df_web.fillna('').iterrows():
+        current_target_row = TARGET_START_ROW + index
+        cleaned_cliente = source_row['Cliente_cleaned']
+        # Limpiar residuo para búsqueda (quitar espacios extra)
+        residuo_value_lookup = str(source_row['Residuo']).strip()
+
+        # Escribir los valores mapeados directamente
+        for source_col, target_col_name in column_mapping.items():
+            if source_col == 'Cliente': value_to_paste = cleaned_cliente
+            else: value_to_paste = source_row[source_col]
+            if target_col_name in target_col_indices:
+                 target_col_idx = target_col_indices[target_col_name]
+                 target_ws.cell(row=current_target_row, column=target_col_idx, value=value_to_paste)
+
+        # Buscar y escribir la Sucursal (si aplica)
+        if 'SUCURSAL' in target_col_indices and sucursal_map:
+            retrieved_sucursal = sucursal_map.get(cleaned_cliente, '')
+            sucursal_col_idx = target_col_indices['SUCURSAL']
+            target_ws.cell(row=current_target_row, column=sucursal_col_idx, value=retrieved_sucursal)
+
+        # Buscar Código SAP con Fuzzy Matching y Resaltar
+        retrieved_codigo = '' # Valor por defecto
+        match_score = 0     # Score por defecto
+
+        if 'CÓDIGO SAP DEL MATERIAL' in target_col_indices and (csap1_keys or csap2_keys):
+            best_match_key = None # Para guardar la clave que coincidió
+
+            # Paso 1: Buscar en CSAP2 ('Item')
+            if csap1_keys:
+                match_result = process.extractOne(residuo_value_lookup, csap1_keys)
+                if match_result:
+                     temp_match_key, temp_score = match_result
+                     if temp_score >= SIMILARITY_THRESHOLD:
+                         retrieved_codigo = codigosap_map1.get(temp_match_key, '')
+                         match_score = temp_score # Guardar el score de la coincidencia exitosa
+                         best_match_key = temp_match_key
+
+            # Paso 2: Si no hubo coincidencia válida en Paso 1, buscar en CodigoSAP (con clave limpia)
+            if not retrieved_codigo and csap2_keys:
+                match_result = process.extractOne(residuo_value_lookup, csap2_keys) # csap2_keys ahora está limpio
+                if match_result:
+                    temp_match_key, temp_score = match_result
+                    if temp_score >= SIMILARITY_THRESHOLD:
+                        retrieved_codigo = codigosap_map2.get(temp_match_key, '')
+                        match_score = temp_score # Guardar el score
+                        best_match_key = temp_match_key
+
+            # Escribir y Resaltar si es necesario
+            codigo_sap_col_idx = target_col_indices['CÓDIGO SAP DEL MATERIAL']
+            cell_to_write = target_ws.cell(row=current_target_row, column=codigo_sap_col_idx)
+            cell_to_write.value = retrieved_codigo
+
+            # Aplicar resaltado
+            if retrieved_codigo and SIMILARITY_THRESHOLD <= match_score < 100:
+                cell_to_write.fill = HIGHLIGHT_FILL
+            else:
+                # Asegurarse que no tenga relleno si no cumple la condición
+                cell_to_write.fill = PatternFill(fill_type=None)
+
+
+        num_rows_written += 1
+    print(f"Se escribieron/actualizaron {num_rows_written} filas.")
+
+    # Limpiar datos antiguos debajo de los nuevos
+    last_written_row = TARGET_START_ROW + num_rows_written - 1
+    max_row_in_sheet = target_ws.max_row
+    # Obtener índices de columnas que realmente estamos llenando
+    cols_to_clear_indices = [target_col_indices[name] for name in target_columns_names if name in target_col_indices]
+
+    if last_written_row < max_row_in_sheet and cols_to_clear_indices:
+         print(f"Limpiando datos antiguos desde fila {last_written_row + 1}...")
+         for row_to_clear in range(last_written_row + 1, max_row_in_sheet + 1):
+              for col_idx in cols_to_clear_indices:
+                   # Limpiar valor y formato
+                   target_ws.cell(row=row_to_clear, column=col_idx, value=None).fill = PatternFill(fill_type=None)
+         print("Limpieza de filas antiguas completada.")
+
+
+    # Guardar archivo de salida
+    print("\nSelecciona dónde guardar el archivo modificado...")
+    output_file = filedialog.asksaveasfilename(
+        title="Guardar archivo modificado como...",
+        defaultextension=".xlsx",
+        filetypes=[("Archivos Excel", "*.xlsx"), ("Todos los archivos", "*.*")],
+        initialfile=f"{os.path.splitext(os.path.basename(input_excel_file))[0]}_actualizado.xlsx"
+    )
+    if not output_file:
+        print("\nOperación cancelada.")
+        sys.exit()
+
+    # Guardar el workbook modificado
+    workbook.save(output_file)
+    print(f"\n--- ¡Proceso completado! ---")
+    print(f"El archivo modificado se ha guardado en: '{output_file}'")
+
+
+except Exception as e:
+    print(f"\nError inesperado: {e}")
+    print(f"Tipo de error: {type(e).__name__}")
+    import traceback
+    traceback.print_exc() # Imprimir más detalles del error
+    sys.exit()
